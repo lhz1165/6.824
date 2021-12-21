@@ -1,3 +1,6 @@
 pkg/
 api.key
 *-handin.tar.gz
+src/bin/dlv
+.gitignore
+src/bin/
