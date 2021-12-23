@@ -14,6 +14,10 @@ type Master struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func findNotStartFile() string {
+	var filanme string = ""
+	return filanme
+}
 
 //
 // an example RPC handler.

@@ -19,11 +19,11 @@ type ExampleArgs struct {
 }
 
 type ExampleReply struct {
-	Y int
+	Y        int
+	FileName string
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

@@ -1,6 +1,12 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"syscall"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -26,14 +32,85 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// Your worker implementation here.
+	//************************map的任务begin************************
+	for {
+		workerMapTask(mapf)
 
-	// uncomment to send the Example RPC to the master.
-	CallExample()
+	}
+	//************************map的任务over************************
 
+	//========================reduce的任务begin========================
+	workerReduceTask(reducef)
+	//========================reduce的任务over========================
+
+}
+
+func getMapTaskNumber() string {
+	return "1"
+}
+func getReduceTaskNumber() string {
+	return "1"
+}
+func workerMapTask(mapf func(string, string) []KeyValue) {
+	//询问操作文件
+	filename := AskMaster()
+	//获取中间结果数组 <aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
+	keyValues := workerProduceKVArrayMap(filename, mapf)
+	//输出中间结果到文件
+	outputIntermediate(keyValues)
+}
+func workerReduceTask(reducef func(string, []string) string) {
+
+}
+
+func outputIntermediate(kvs []KeyValue) {
+	X := getMapTaskNumber()
+	//task任务编号
+	Y := getReduceTaskNumber()
+	intermediateFile, err := os.OpenFile("mr-"+X+"-"+Y, syscall.O_RDWR|syscall.O_CREAT, 0777)
+
+	if err != nil {
+		return
+	}
+	//把keyValues数组作为json数据写入文件
+	enc := json.NewEncoder(intermediateFile)
+	for _, kv := range kvs {
+		enc.Encode(&kv)
+	}
+}
+func inputIntermediate(filename string, sameIntermediate []KeyValue) {
+	intermediateFile, err := os.OpenFile(filename, syscall.O_RDWR|syscall.O_CREAT, 0777)
+	if err != nil {
+		return
+	}
+	dec := json.NewDecoder(intermediateFile)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			break
+		}
+		sameIntermediate = append(sameIntermediate, kv)
+	}
+}
+
+//输出<aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
+func workerProduceKVArrayMap(filename string, mapf func(string, string) []KeyValue) []KeyValue {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	//aa b1 aa c1 aa b1
+	//输出
+	//<aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
+	kva := mapf(filename, string(content))
+	return kva
 }
 
 //
@@ -57,6 +134,22 @@ func CallExample() {
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
+}
+func AskMaster() string {
+	// declare an argument structure.
+	args := ExampleArgs{}
+
+	// fill in the argument(s).
+	args.X = 99
+
+	// declare a reply structure.
+	reply := ExampleReply{}
+
+	// send the RPC request, wait for the reply.
+	call("Master.findNotStartFile", &args, &reply)
+
+	return reply.FileName
+
 }
 
 //
