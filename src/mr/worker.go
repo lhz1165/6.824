@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"syscall"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -36,8 +37,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	// Your worker implementation here.
 	//************************map的任务begin************************
 	for {
+		//
 		workerMapTask(mapf)
-
+		//睡眠几秒
+		time.Sleep(time.Duration(5) * time.Second)
 	}
 	//************************map的任务over************************
 
