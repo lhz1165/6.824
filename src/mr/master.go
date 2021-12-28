@@ -185,6 +185,7 @@ func (m *Master) Done() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.done
+	//return false
 }
 
 func (m *Master) tickSchedule() {

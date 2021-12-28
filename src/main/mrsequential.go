@@ -56,7 +56,7 @@ func main() {
 		//输出
 		//<aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
 		kva := mapf(filename, string(content))
-		fmt.Printf("%v\n", kva)
+		//fmt.Printf("%v\n", kva)
 		intermediate = append(intermediate, kva...)
 	}
 

@@ -1,12 +1,17 @@
 package main
 
-import "sort"
-
 //
 // an indexing application "plugin" for MapReduce.
 //
 // go build -buildmode=plugin indexer.go
 //
+
+import "fmt"
+import "../mr"
+
+import "strings"
+import "unicode"
+import "sort"
 
 // The mapping function is called once for each piece of the input.
 // In this framework, the key is the name of the file that is being processed,
@@ -30,6 +35,5 @@ func Map(document string, value string) (res []mr.KeyValue) {
 // should be a single output value for that key.
 func Reduce(key string, values []string) string {
 	sort.Strings(values)
-	sort.Strings()
 	return fmt.Sprintf("%d %s", len(values), strings.Join(values, ","))
 }
