@@ -3,14 +3,13 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"log"
+	"net/rpc"
 	"os"
-	"syscall"
-	"time"
+	"strings"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 //
 // Map functions return a slice of KeyValue.
@@ -22,7 +21,7 @@ type KeyValue struct {
 
 //
 // use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
+// Task number for each KeyValue emitted by Map.
 //
 func ihash(key string) int {
 	h := fnv.New32a()
@@ -30,129 +29,163 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-//
-// main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+
 	// Your worker implementation here.
-	//************************map的任务begin************************
+	w := worker{}
+	w.mapf = mapf
+	w.reducef = reducef
+	//注册 然后获得一个workerId
+	w.register()
+	//跑
+	w.run()
+
+	// uncomment to send the Example RPC to the master.
+	// CallExample()
+
+}
+
+type worker struct {
+	id      int
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
+}
+
+func (w *worker) run() {
+	// if reqTask conn fail, worker exit
 	for {
-		//
-		workerMapTask(mapf)
-		//睡眠几秒
-		time.Sleep(time.Duration(5) * time.Second)
-	}
-	//************************map的任务over************************
-
-	//========================reduce的任务begin========================
-	workerReduceTask(reducef)
-	//========================reduce的任务over========================
-
-}
-
-func getMapTaskNumber() string {
-	return "1"
-}
-func getReduceTaskNumber() string {
-	return "1"
-}
-func workerMapTask(mapf func(string, string) []KeyValue) {
-	//询问操作文件
-	filename := AskMaster()
-	//获取中间结果数组 <aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
-	keyValues := workerProduceKVArrayMap(filename, mapf)
-	//输出中间结果到文件
-	outputIntermediate(keyValues)
-}
-func workerReduceTask(reducef func(string, []string) string) {
-
-}
-
-func outputIntermediate(kvs []KeyValue) {
-	X := getMapTaskNumber()
-	//task任务编号
-	Y := getReduceTaskNumber()
-	intermediateFile, err := os.OpenFile("mr-"+X+"-"+Y, syscall.O_RDWR|syscall.O_CREAT, 0777)
-
-	if err != nil {
-		return
-	}
-	//把keyValues数组作为json数据写入文件
-	enc := json.NewEncoder(intermediateFile)
-	for _, kv := range kvs {
-		enc.Encode(&kv)
-	}
-}
-func inputIntermediate(filename string, sameIntermediate []KeyValue) {
-	intermediateFile, err := os.OpenFile(filename, syscall.O_RDWR|syscall.O_CREAT, 0777)
-	if err != nil {
-		return
-	}
-	dec := json.NewDecoder(intermediateFile)
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err != nil {
-			break
+		//获得一个任务 map or reduce
+		t := w.reqTask()
+		if !t.Alive {
+			DPrintf("worker get task not alive, exit")
+			return
 		}
-		sameIntermediate = append(sameIntermediate, kv)
+		w.doTask(t)
 	}
 }
 
-//输出<aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
-func workerProduceKVArrayMap(filename string, mapf func(string, string) []KeyValue) []KeyValue {
-	file, err := os.Open(filename)
+func (w *worker) reqTask() Task {
+	args := TaskArgs{}
+	args.WorkerId = w.id
+	reply := TaskReply{}
+
+	if ok := call("Master.GetOneTask", &args, &reply); !ok {
+		DPrintf("worker get task fail,exit")
+		os.Exit(1)
+	}
+	DPrintf("worker get task:%+v", reply.Task)
+	return *reply.Task
+}
+
+func (w *worker) doTask(t Task) {
+	DPrintf("in do Task")
+
+	switch t.Phase {
+	case MapPhase:
+		w.doMapTask(t)
+	case ReducePhase:
+		w.doReduceTask(t)
+	default:
+		panic(fmt.Sprintf("task phase err: %v", t.Phase))
+	}
+
+}
+
+//一个map可以产生多个file，每个file分配给指定reduce worker
+func (w *worker) doMapTask(t Task) {
+	contents, err := ioutil.ReadFile(t.FileName)
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		w.reportTask(t, false, err)
+		return
 	}
-	content, err := ioutil.ReadAll(file)
+
+	kvs := w.mapf(t.FileName, string(contents))
+	reduces := make([][]KeyValue, t.NReduce)
+	//按照reduce任务给kvs分以下类
+	for _, kv := range kvs {
+		idx := ihash(kv.Key) % t.NReduce
+		reduces[idx] = append(reduces[idx], kv)
+	}
+
+	for idx, l := range reduces {
+		fileName := reduceName(t.Seq, idx)
+		f, err := os.Create(fileName)
+		if err != nil {
+			w.reportTask(t, false, err)
+			return
+		}
+		enc := json.NewEncoder(f)
+		for _, kv := range l {
+			if err := enc.Encode(&kv); err != nil {
+				w.reportTask(t, false, err)
+			}
+
+		}
+		if err := f.Close(); err != nil {
+			w.reportTask(t, false, err)
+		}
+	}
+	w.reportTask(t, true, nil)
+
+}
+
+func (w *worker) doReduceTask(t Task) {
+	maps := make(map[string][]string)
+	for idx := 0; idx < t.NMaps; idx++ {
+		fileName := reduceName(idx, t.Seq)
+		file, err := os.Open(fileName)
+		if err != nil {
+			w.reportTask(t, false, err)
+			return
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			if _, ok := maps[kv.Key]; !ok {
+				maps[kv.Key] = make([]string, 0, 100)
+			}
+			maps[kv.Key] = append(maps[kv.Key], kv.Value)
+		}
+	}
+
+	res := make([]string, 0, 100)
+	for k, v := range maps {
+		res = append(res, fmt.Sprintf("%v %v\n", k, w.reducef(k, v)))
+	}
+
+	if err := ioutil.WriteFile(mergeName(t.Seq), []byte(strings.Join(res, "")), 0600); err != nil {
+		w.reportTask(t, false, err)
+	}
+
+	w.reportTask(t, true, nil)
+}
+
+func (w *worker) reportTask(t Task, done bool, err error) {
 	if err != nil {
-		log.Fatalf("cannot read %v", filename)
+		log.Printf("%v", err)
 	}
-	file.Close()
-	//aa b1 aa c1 aa b1
-	//输出
-	//<aa,1><b1,1><aa,1><c1,1><aa,1><b1,1>
-	kva := mapf(filename, string(content))
-	return kva
+	args := ReportTaskArgs{}
+	args.Done = done
+	args.Seq = t.Seq
+	args.Phase = t.Phase
+	args.WorkerId = w.id
+	reply := ReportTaskReply{}
+	if ok := call("Master.ReportTask", &args, &reply); !ok {
+		DPrintf("report task fail:%+v", args)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
-}
-func AskMaster() string {
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.findNotStartFile", &args, &reply)
-
-	return reply.FileName
-
+func (w *worker) register() {
+	args := &RegisterArgs{}
+	reply := &RegisterReply{}
+	if ok := call("Master.RegWorker", args, reply); !ok {
+		log.Fatal("reg fail")
+	}
+	w.id = reply.WorkerId
 }
 
 //
@@ -161,11 +194,12 @@ func AskMaster() string {
 // returns false if something goes wrong.
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	//sockname := masterSock()
-	//c, err := rpc.DialHTTP("unix", sockname)
+	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	sockname := masterSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		DPrintf("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
@@ -174,6 +208,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	DPrintf("%+v", err)
 	return false
 }
