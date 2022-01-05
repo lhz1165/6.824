@@ -2,163 +2,105 @@ package mr
 
 import (
 	"log"
-	"net"
-	"net/http"
-	"net/rpc"
-	"os"
 	"sync"
 	"time"
 )
+import "net"
+import "os"
+import "net/rpc"
+import "net/http"
 
-const (
-	TaskStatusReady   = 0
-	TaskStatusQueue   = 1
-	TaskStatusRunning = 2
-	TaskStatusFinish  = 3
-	TaskStatusErr     = 4
-)
-
-const (
-	MaxTaskRunTime   = time.Second * 5
-	ScheduleInterval = time.Millisecond * 500
-)
-
-type TaskStat struct {
-	Status    int
-	WorkerId  int
-	StartTime time.Time
-}
+type TaskType int
 
 type Master struct {
+	mu sync.Mutex
 	// Your definitions here.
-	files     []string
-	nReduce   int
-	taskPhase TaskPhase
-	taskStats []TaskStat
-	mu        sync.Mutex
-	done      bool
-	workerSeq int
-	taskCh    chan Task
+	TaskType        TaskType
+	nMapTaskNums    int
+	nReduceTaskNums int
+	//任务的完成情况
+	mapTaskDone       []bool
+	mapTaskStartTime  []time.Time
+	mapTaskFinishTime []time.Time
+
+	reduceTaskDone       []bool
+	reduceTaskStartTime  []time.Time
+	reduceTaskFinishTime []time.Time
+	//读写文件地址
+	mapSeq int
+	isDone bool
+}
+type AskTaskReq struct {
 }
 
-func (m *Master) getTask(taskSeq int) Task {
-	task := Task{
-		FileName: "",
-		NReduce:  m.nReduce,
-		NMaps:    len(m.files),
-		Seq:      taskSeq,
-		Phase:    m.taskPhase,
-		Alive:    true,
-	}
-	DPrintf("m:%+v, taskseq:%d, lenfiles:%d, lents:%d", m, taskSeq, len(m.files), len(m.taskStats))
-	if task.Phase == MapPhase {
-		task.FileName = m.files[taskSeq]
-	}
-	return task
+type AskTaskResp struct {
+	TaskType TaskType
+	index    int
 }
 
-func (m *Master) schedule() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.done {
-		return
-	}
-	allFinish := true
-	for index, t := range m.taskStats {
-		switch t.Status {
-		case TaskStatusReady:
-			allFinish = false
-			m.taskCh <- m.getTask(index)
-			m.taskStats[index].Status = TaskStatusQueue
-		case TaskStatusQueue:
-			allFinish = false
-		case TaskStatusRunning:
-			allFinish = false
-			if time.Now().Sub(t.StartTime) > MaxTaskRunTime {
-				m.taskStats[index].Status = TaskStatusQueue
-				m.taskCh <- m.getTask(index)
-			}
-		case TaskStatusFinish:
-		case TaskStatusErr:
-			allFinish = false
-			m.taskStats[index].Status = TaskStatusQueue
-			m.taskCh <- m.getTask(index)
-		default:
-			panic("t.status err")
-		}
-	}
-	if allFinish {
-		if m.taskPhase == MapPhase {
-			m.initReduceTask()
-		} else {
-			m.done = true
-		}
-	}
+type FinishTaskReq struct {
+	TaskType TaskType
+	index    int
 }
-
-func (m *Master) initMapTask() {
-	m.taskPhase = MapPhase
-	m.taskStats = make([]TaskStat, len(m.files))
-}
-
-func (m *Master) initReduceTask() {
-	DPrintf("init ReduceTask")
-	m.taskPhase = ReducePhase
-	m.taskStats = make([]TaskStat, m.nReduce)
-}
-
-func (m *Master) regTask(args *TaskArgs, task *Task) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if task.Phase != m.taskPhase {
-		panic("req Task phase neq")
-	}
-
-	m.taskStats[task.Seq].Status = TaskStatusRunning
-	m.taskStats[task.Seq].WorkerId = args.WorkerId
-	m.taskStats[task.Seq].StartTime = time.Now()
+type FinishTaskResp struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (m *Master) GetOneTask(args *TaskArgs, reply *TaskReply) error {
-	task := <-m.taskCh
-	reply.Task = &task
+func (m *Master) AskTaskHandler(req AskTaskReq, resp AskTaskResp) {
+	//map
+	isDone := false
+	for {
+		for index, done := range m.mapTaskDone {
+			//没有做的任务派发出去
+			if !done {
+				resp.TaskType = 1
+				m.mapTaskDone[index] = true
+				m.mapTaskStartTime[index] = time.Now()
+				return
+			}
+		}
+		//如果所有任务都派发出去了等待他们都做完
+		//失败的 超时的重新发布
+		if !isDone {
 
-	if task.Alive {
-		m.regTask(args, &task)
+		} else {
+			//所有的map完成 派发reduce
+			break
+		}
 	}
-	DPrintf("in get one Task, args:%+v, reply:%+v", args, reply)
-	return nil
+
+	//reduce
+	for {
+		for index, done := range m.reduceTaskDone {
+			//没有做的任务派发出去
+			if !done {
+				resp.TaskType = 1
+				m.reduceTaskDone[index] = true
+				m.reduceTaskStartTime[index] = time.Now()
+				return
+			}
+		}
+		//如果所有任务都派发出去了等待他们都做完
+		//失败的 超时的重新发布
+		if !isDone {
+
+		} else {
+			//所有的map完成 派发reduce
+			break
+		}
+	}
+
 }
 
-func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	DPrintf("get report task: %+v, taskPhase: %+v", args, m.taskPhase)
-
-	if m.taskPhase != args.Phase || args.WorkerId != m.taskStats[args.Seq].WorkerId {
-		return nil
-	}
-
-	if args.Done {
-		m.taskStats[args.Seq].Status = TaskStatusFinish
+func (m *Master) FinishTaskHandler(req FinishTaskReq, resp FinishTaskResp) {
+	taskType := req.TaskType
+	index := req.index
+	//完成时间
+	if taskType == 1 {
+		m.mapTaskFinishTime[index] = time.Now()
 	} else {
-		m.taskStats[args.Seq].Status = TaskStatusErr
+		m.reduceTaskFinishTime[index] = time.Now()
 	}
-
-	go m.schedule()
-	return nil
-}
-
-func (m *Master) RegWorker(args *RegisterArgs, reply *RegisterReply) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.workerSeq += 1
-	reply.WorkerId = m.workerSeq
-	return nil
 }
 
 //
@@ -182,38 +124,31 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.done
-	//return false
-}
+	ret := false
 
-func (m *Master) tickSchedule() {
-	// 按说应该是每个 task 一个 timer，此处简单处理
-	for !m.Done() {
-		go m.schedule()
-		time.Sleep(ScheduleInterval)
-	}
+	// Your code here.
+
+	return ret
 }
 
 //
 // create a Master.
+// main/mrmaster.go calls this function.
+// nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	m.mu = sync.Mutex{}
-	m.nReduce = nReduce
-	m.files = files
-	if nReduce > len(files) {
-		m.taskCh = make(chan Task, nReduce)
-	} else {
-		m.taskCh = make(chan Task, len(m.files))
-	}
 
-	m.initMapTask()
-	go m.tickSchedule()
-	m.server()
-	DPrintf("master init")
 	// Your code here.
+	m.nMapTaskNums = len(files)
+	m.nReduceTaskNums = nReduce
+	m.mapTaskDone = make([]bool, m.nMapTaskNums)
+	m.mapTaskStartTime = make([]time.Time, m.nMapTaskNums)
+
+	m.reduceTaskDone = make([]bool, m.nReduceTaskNums)
+	m.reduceTaskStartTime = make([]time.Time, m.nReduceTaskNums)
+	m.mapSeq = 0
+	m.isDone = false
+	m.server()
 	return &m
 }
